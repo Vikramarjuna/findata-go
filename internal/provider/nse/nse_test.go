@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Vikramarjuna/findata-go/config"
@@ -540,9 +541,10 @@ func mockValidNSEResponse() string {
 func TestGet_ValidMockResponse(t *testing.T) {
 	// Create a test server that returns valid NSE-like JSON
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request headers
-		if r.Header.Get("Accept") != "application/json" {
-			t.Errorf("Accept header = %s, want application/json", r.Header.Get("Accept"))
+		// Verify request headers — Accept negotiates JSON but includes
+		// browser-style fallbacks to avoid Akamai edge blocking.
+		if !strings.Contains(r.Header.Get("Accept"), "application/json") {
+			t.Errorf("Accept header = %s, want to contain application/json", r.Header.Get("Accept"))
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(mockValidNSEResponse()))
@@ -757,8 +759,10 @@ func TestGet_RequestHeaders(t *testing.T) {
 	// Verify that correct headers are sent
 	headersCaptured := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check headers
-		if r.Header.Get("Accept") == "application/json" &&
+		// Check headers. NSE's edge (Akamai) blocks non-browser clients, so
+		// we mimic a browser: Accept negotiates JSON with fallbacks, a
+		// realistic User-Agent, English locale, and an XHR-style marker.
+		if strings.Contains(r.Header.Get("Accept"), "application/json") &&
 			r.Header.Get("Accept-Language") == "en-US,en;q=0.9" &&
 			r.Header.Get("User-Agent") != "" {
 			headersCaptured = true

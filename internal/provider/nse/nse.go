@@ -7,14 +7,31 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Vikramarjuna/findata-go/config"
 	"github.com/Vikramarjuna/findata-go/internal/provider"
 	"github.com/Vikramarjuna/findata-go/logger"
 )
+
+// nseBrowserUserAgent is what real browsers send. NSE's Akamai edge
+// blocks non-browser User-Agents outright with a 403, so we override the
+// findata-go default UA for NSE requests only.
+const nseBrowserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// nseHomeURL is hit to seed cookies before an API request. NSE's API
+// endpoints require the session cookies set by the main site.
+const nseHomeURL = "https://www.nseindia.com/"
+
+// nseWarmupTTL controls how often we re-hit the homepage. Session cookies
+// expire; refreshing every few minutes keeps them alive.
+const nseWarmupTTL = 5 * time.Minute
 
 const (
 	// BaseURL is the NSE India API base URL
@@ -27,20 +44,40 @@ const (
 // Provider implements the NSE data provider
 type Provider struct {
 	baseURL string // Allow overriding for testing
+
+	// httpClient holds a cookie jar so session cookies obtained from the
+	// homepage warmup are reused on subsequent API calls. NSE's edge
+	// requires them.
+	httpClient   *http.Client
+	warmupMu     sync.Mutex
+	lastWarmedAt time.Time
+}
+
+func newProvider(baseURL string) *Provider {
+	jar, _ := cookiejar.New(nil)
+	// Clone the configured HTTP client so we can attach a cookie jar without
+	// mutating the shared global client used by other providers.
+	base := config.GetHTTPClient()
+	client := &http.Client{
+		Transport:     base.Transport,
+		CheckRedirect: base.CheckRedirect,
+		Timeout:       base.Timeout,
+		Jar:           jar,
+	}
+	return &Provider{
+		baseURL:    baseURL,
+		httpClient: client,
+	}
 }
 
 // New creates a new NSE provider
 func New() *Provider {
-	return &Provider{
-		baseURL: BaseURL,
-	}
+	return newProvider(BaseURL)
 }
 
 // NewWithBaseURL creates a new NSE provider with custom base URL (for testing)
 func NewWithBaseURL(baseURL string) *Provider {
-	return &Provider{
-		baseURL: baseURL,
-	}
+	return newProvider(baseURL)
 }
 
 // Name returns the provider name
@@ -147,6 +184,41 @@ func (p *Provider) Get(symbol string) (*provider.Quote, error) {
 	return quote, nil
 }
 
+// warmUp fetches the NSE homepage so the cookie jar picks up the session
+// cookies the API endpoints require. Safe to call repeatedly; hits the
+// network at most once per nseWarmupTTL unless force is set.
+func (p *Provider) warmUp(force bool) error {
+	p.warmupMu.Lock()
+	defer p.warmupMu.Unlock()
+
+	if !force && !p.lastWarmedAt.IsZero() && time.Since(p.lastWarmedAt) < nseWarmupTTL {
+		return nil
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", nseHomeURL, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("build warmup request: %w", err)
+	}
+	req.Header.Set("User-Agent", nseBrowserUserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("warmup request failed: %w", err)
+	}
+	// We only care about the Set-Cookie side effect on the jar; drain and
+	// close.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("warmup returned status %d", resp.StatusCode)
+	}
+	p.lastWarmedAt = time.Now()
+	return nil
+}
+
 func (p *Provider) fetchNSEData(symbol string) (*nseQuoteResponse, error) {
 	apiURL, err := url.Parse(p.baseURL + QuoteEndpoint)
 	if err != nil {
@@ -162,63 +234,87 @@ func (p *Provider) fetchNSEData(symbol string) (*nseQuoteResponse, error) {
 
 	logger.Debug("creating NSE API request", "url", apiURL.String(), "symbol", symbol)
 
-	req, err := http.NewRequestWithContext(context.Background(), "GET", apiURL.String(), http.NoBody)
-	if err != nil {
-		logger.Error("failed to create NSE request", "error", err, "symbol", symbol)
-		return nil, &provider.Error{
-			Message:  "failed to create request: " + err.Error(),
-			Provider: p.Name(),
+	// One retry: if the first call gets blocked, re-warm cookies and try
+	// again. Anything else is a real failure.
+	var lastBody []byte
+	var lastStatus int
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := p.warmUp(attempt > 0); err != nil {
+			logger.Warn("NSE warmup failed", "error", err, "symbol", symbol, "attempt", attempt)
+			// A warmup failure isn't fatal on its own — try the API and let
+			// the status-code branch decide.
 		}
-	}
 
-	// Set headers to mimic browser request
-	req.Header.Set("User-Agent", config.GetUserAgent())
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
-	logger.Debug("sending HTTP request to NSE", "symbol", symbol)
-	resp, err := config.GetHTTPClient().Do(req)
-	if err != nil {
-		logger.Error("NSE HTTP request failed", "error", err, "symbol", symbol, "url", apiURL.String())
-		return nil, &provider.Error{
-			Message:  "HTTP request failed: " + err.Error(),
-			Provider: p.Name(),
+		req, err := http.NewRequestWithContext(context.Background(), "GET", apiURL.String(), http.NoBody)
+		if err != nil {
+			logger.Error("failed to create NSE request", "error", err, "symbol", symbol)
+			return nil, &provider.Error{
+				Message:  "failed to create request: " + err.Error(),
+				Provider: p.Name(),
+			}
 		}
-	}
-	defer func() {
+
+		// Browser-like headers. NSE's edge (Akamai) rejects the default
+		// findata-go User-Agent outright, so override it here.
+		req.Header.Set("User-Agent", nseBrowserUserAgent)
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Referer", "https://www.nseindia.com/get-quotes/equity?symbol="+url.QueryEscape(symbol))
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+		logger.Debug("sending HTTP request to NSE", "symbol", symbol, "attempt", attempt)
+		resp, err := p.httpClient.Do(req)
+		if err != nil {
+			logger.Error("NSE HTTP request failed", "error", err, "symbol", symbol, "url", apiURL.String())
+			return nil, &provider.Error{
+				Message:  "HTTP request failed: " + err.Error(),
+				Provider: p.Name(),
+			}
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		logger.Warn("NSE API returned non-OK status", "status_code", resp.StatusCode, "symbol", symbol, "response", string(body))
-		return nil, &provider.Error{
-			Message:  "NSE API returned error: " + string(body),
-			Code:     resp.StatusCode,
-			Provider: p.Name(),
+		if readErr != nil {
+			logger.Error("failed to read NSE response body", "error", readErr, "symbol", symbol)
+			return nil, &provider.Error{
+				Message:  "failed to read response: " + readErr.Error(),
+				Provider: p.Name(),
+			}
 		}
+
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+			// Cookies likely stale/missing — force a re-warm and retry once.
+			lastBody, lastStatus = body, resp.StatusCode
+			logger.Warn("NSE returned access denied, will retry with fresh cookies",
+				"status_code", resp.StatusCode, "symbol", symbol, "attempt", attempt)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			logger.Warn("NSE API returned non-OK status", "status_code", resp.StatusCode, "symbol", symbol, "response", string(body))
+			return nil, &provider.Error{
+				Message:  "NSE API returned error: " + string(body),
+				Code:     resp.StatusCode,
+				Provider: p.Name(),
+			}
+		}
+
+		logger.Debug("parsing NSE JSON response", "symbol", symbol, "body_size", len(body))
+		var result nseQuoteResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			logger.Error("failed to parse NSE JSON", "error", err, "symbol", symbol)
+			return nil, &provider.Error{
+				Message:  "failed to parse JSON: " + err.Error(),
+				Provider: p.Name(),
+			}
+		}
+		return &result, nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Error("failed to read NSE response body", "error", err, "symbol", symbol)
-		return nil, &provider.Error{
-			Message:  "failed to read response: " + err.Error(),
-			Provider: p.Name(),
-		}
+	return nil, &provider.Error{
+		Message:  "NSE API returned error: " + string(lastBody),
+		Code:     lastStatus,
+		Provider: p.Name(),
 	}
-
-	logger.Debug("parsing NSE JSON response", "symbol", symbol, "body_size", len(body))
-	var result nseQuoteResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		logger.Error("failed to parse NSE JSON", "error", err, "symbol", symbol)
-		return nil, &provider.Error{
-			Message:  "failed to parse JSON: " + err.Error(),
-			Provider: p.Name(),
-		}
-	}
-
-	return &result, nil
 }
 
 func (p *Provider) mapToQuote(result *nseQuoteResponse) *provider.Quote {
